@@ -402,18 +402,34 @@ app.post('/register', registerLimiter, (req, res) => {
 
 /**
  * Authorization endpoint — serves an HTML credential form.
- * Odoo has no standard OAuth2 flow, so we capture credentials directly
- * and validate them against Odoo's session API.
+ * Handles two scenarios:
+ *   1. Initial OAuth flow (redirect_uri present) — stores pending auth, shows form.
+ *   2. PRG retry (redirect_uri absent, state already registered) — re-shows form with
+ *      error/prefill from query params after a failed credential attempt.
+ *
+ * The PRG (Post-Redirect-Get) pattern ensures retries are always GET requests,
+ * which avoids browser "confirm resubmission" issues and keeps history clean.
  */
 app.get('/authorize', (req, res) => {
   const q = req.query as Record<string, string>;
   const { state, redirect_uri, client_id, code_challenge, code_challenge_method } = q;
 
+  const renderForm = (err?: string) =>
+    res.set('X-Frame-Options', 'DENY')
+       .set('X-Content-Type-Options', 'nosniff')
+       .set('Content-Security-Policy', "default-src 'none'; style-src 'unsafe-inline'; script-src 'unsafe-inline'; form-action 'self'")
+       .send(renderConnectForm(state, { url: q.url, db: q.db, username: q.username }, err));
+
+  // PRG retry: state already registered, coming back after a failed credential attempt
+  if (state && pendingAuths.has(state) && !redirect_uri) {
+    return renderForm(q.error);
+  }
+
+  // Normal OAuth init flow
   if (!state || !redirect_uri || !code_challenge) {
     return res.status(400).send('<h2>Missing required OAuth parameters (state, redirect_uri, code_challenge).</h2>');
   }
 
-  // Validate redirect_uri against the registered client's allowed URIs
   const client = registeredClients.get(client_id ?? '');
   if (client && !client.redirectUris.includes(redirect_uri)) {
     return res.status(400).send('<h2>redirect_uri is not registered for this client.</h2>');
@@ -427,23 +443,12 @@ app.get('/authorize', (req, res) => {
     createdAt: Date.now(),
   });
 
-  res.set('X-Frame-Options', 'DENY')
-     .set('X-Content-Type-Options', 'nosniff')
-     .set('Content-Security-Policy', "default-src 'none'; style-src 'unsafe-inline'; script-src 'unsafe-inline'; form-action 'self'")
-     .send(renderConnectForm(state));
+  renderForm();
 });
 
 /** Handle the credential form submission */
 app.post('/authorize/submit', authLimiter, async (req, res) => {
   const { state, odoo_url, odoo_db, odoo_user, odoo_password } = req.body as Record<string, string>;
-
-  // Security headers on every form response
-  res.set('X-Frame-Options', 'DENY')
-     .set('X-Content-Type-Options', 'nosniff')
-     .set('Content-Security-Policy', "default-src 'none'; style-src 'unsafe-inline'; script-src 'unsafe-inline'; form-action 'self'");
-
-  const sendForm = (prefill?: { url?: string; db?: string; username?: string }, error?: string) =>
-    res.send(renderConnectForm(state, prefill, error));
 
   const pending = pendingAuths.get(state);
   if (!pending) {
@@ -455,23 +460,31 @@ app.post('/authorize/submit', authLimiter, async (req, res) => {
   const username = (odoo_user ?? '').trim().slice(0, 255);
   const password = (odoo_password ?? '').trim().slice(0, 1024);
 
+  // PRG: redirect back to GET /authorize with error + prefill so retries always use GET
+  const redirectError = (msg: string, keepUrl = true) => {
+    const u = new URL(`${BASE_URL}/authorize`);
+    u.searchParams.set('state', state);
+    u.searchParams.set('error', msg);
+    if (keepUrl && url) u.searchParams.set('url', url);
+    if (keepUrl && db) u.searchParams.set('db', db);
+    if (keepUrl && username) u.searchParams.set('username', username);
+    return res.redirect(u.toString());
+  };
+
   if (!url || !username || !password) {
-    return sendForm({ url, db, username }, 'Odoo URL, email, and password are required.');
+    return redirectError('Odoo URL, email, and password are required.');
   }
 
-  // SSRF protection — block private/internal URLs
+  // SSRF protection — block private/internal URLs (don't reflect the URL back)
   if (isPrivateUrl(url)) {
-    return sendForm({ url, db, username }, 'Invalid Odoo URL. Private or non-HTTP(S) URLs are not allowed.');
+    return redirectError('Invalid Odoo URL. Private or non-HTTP(S) URLs are not allowed.', false);
   }
 
   try {
     if (!db) {
       const detected = await detectDb(url);
       if (!detected) {
-        return sendForm(
-          { url, db, username },
-          'Could not auto-detect the database name. Please enter it manually.',
-        );
+        return redirectError('Could not auto-detect the database name. Please enter it manually.');
       }
       db = detected;
     }
@@ -499,7 +512,7 @@ app.post('/authorize/submit', authLimiter, async (req, res) => {
 
   } catch (err: unknown) {
     const msg = extractErrorMessage(err, 'Authentication failed. Please check your credentials.');
-    sendForm({ url, db, username }, msg);
+    redirectError(msg);
   }
 });
 
