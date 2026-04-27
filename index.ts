@@ -26,12 +26,13 @@ import express, { type Request, type Response } from 'express';
 import cors from 'cors';
 import axios from 'axios';
 import rateLimit from 'express-rate-limit';
-import { createHash, randomBytes } from 'crypto';
+import { createHash, randomBytes, timingSafeEqual } from 'crypto';
 import dotenv from 'dotenv';
 
 dotenv.config();
 
 const app = express();
+app.set('trust proxy', 1); // Required for correct IP detection behind Railway / any reverse proxy
 const PORT = parseInt(process.env.PORT ?? '3000');
 
 // Optional pre-shared secret for the /register endpoint (RFC 7591 §3.4).
@@ -73,7 +74,6 @@ interface OdooContext {
 interface PendingAuth {
   clientId: string;
   redirectUri: string;
-  state: string;
   codeChallenge: string;
   codeChallengeMethod: string;
   createdAt: number;
@@ -118,13 +118,29 @@ setInterval(() => {
   }
 }, 5 * 60_000);
 
-// Access tokens: 30-day TTL matching the expires_in we advertise.
+// Access tokens: 1-year backstop cleanup (memory leak guard only).
+// Active sessions are kept alive by the keepalive interval below.
 setInterval(() => {
-  const cutoff = Date.now() - 30 * 24 * 60 * 60_000;
+  const cutoff = Date.now() - 365 * 24 * 60 * 60_000;
   for (const [k, v] of accessTokens) {
     if (v.createdAt < cutoff) accessTokens.delete(k);
   }
-}, 60 * 60_000);
+}, 24 * 60 * 60_000);
+
+// Keepalive: prevent Odoo sessions from expiring due to inactivity.
+// Runs every 6 days — below Odoo's default 1-week session timeout.
+// If a session has already expired, the token is removed so Dust surfaces
+// a clean "Connect" prompt instead of a confusing error on next use.
+setInterval(async () => {
+  for (const [token, stored] of accessTokens) {
+    try {
+      const client = new OdooClient(stored.ctx);
+      await client.callKw('res.lang', 'search_count', [[]], {});
+    } catch {
+      accessTokens.delete(token);
+    }
+  }
+}, 6 * 24 * 60 * 60_000);
 
 // ============================================================
 // SSRF PROTECTION
@@ -135,8 +151,15 @@ function isPrivateUrl(urlStr: string): boolean {
     const u = new URL(urlStr);
     if (u.protocol !== 'http:' && u.protocol !== 'https:') return true;
     const h = u.hostname.toLowerCase();
+
+    // Loopback / reserved hostnames
     if (h === 'localhost') return true;
     if (h.endsWith('.local') || h.endsWith('.internal') || h.endsWith('.localhost')) return true;
+
+    // IPv6 — block all literals; legitimate Odoo servers use domain names
+    if (h.includes(':')) return true;
+
+    // IPv4 private ranges
     const ipv4 = h.match(/^(\d{1,3})\.(\d{1,3})\.(\d{1,3})\.(\d{1,3})$/);
     if (ipv4) {
       const [a, b] = ipv4.slice(1).map(Number);
@@ -144,13 +167,29 @@ function isPrivateUrl(urlStr: string): boolean {
       if (a === 172 && b >= 16 && b <= 31) return true;  // 172.16.0.0/12
       if (a === 192 && b === 168) return true;            // 192.168.0.0/16
       if (a === 127) return true;                         // 127.0.0.0/8
-      if (a === 169 && b === 254) return true;            // 169.254.0.0/16 (link-local / AWS metadata)
+      if (a === 169 && b === 254) return true;            // 169.254.0.0/16 (AWS metadata / link-local)
       if (a === 0) return true;
     }
+
     return false;
   } catch {
     return true; // unparseable URL → block
   }
+}
+
+// ============================================================
+// CONSTANT-TIME STRING COMPARISON
+// ============================================================
+
+function safeCompare(a: string, b: string): boolean {
+  const aBuf = Buffer.from(a);
+  const bBuf = Buffer.from(b);
+  // Buffers must be same length for timingSafeEqual; pad shorter one to avoid length leak
+  if (aBuf.length !== bBuf.length) {
+    timingSafeEqual(aBuf, Buffer.alloc(aBuf.length)); // dummy compare to normalize timing
+    return false;
+  }
+  return timingSafeEqual(aBuf, bBuf);
 }
 
 // ============================================================
@@ -161,6 +200,17 @@ function verifyPKCE(verifier: string, challenge: string, method: string): boolea
   if (method !== 'S256') return false;
   const hash = createHash('sha256').update(verifier).digest('base64url');
   return hash === challenge;
+}
+
+// ============================================================
+// CUSTOM ERRORS
+// ============================================================
+
+class OdooSessionExpiredError extends Error {
+  constructor() {
+    super('Odoo session expired — please reconnect from Dust.');
+    this.name = 'OdooSessionExpiredError';
+  }
 }
 
 // ============================================================
@@ -199,13 +249,13 @@ class OdooClient {
         jsonrpc: '2.0', method: 'call', id: nextId(),
         params: { model, method, args, kwargs: { context: {}, ...kwargs } },
       },
-      { headers: { 'Content-Type': 'application/json', Cookie: this.cookieHeader }, timeout: 30_000 },
+      { headers: { 'Content-Type': 'application/json', Cookie: this.cookieHeader }, timeout: 30_000, maxRedirects: 0 },
     );
     if (resp.data.error) {
       const msg: string = resp.data.error.data?.message ?? resp.data.error.message ?? 'Odoo error';
       // Surface session expiry clearly so the user knows to reconnect
       if (msg.toLowerCase().includes('session') || resp.data.error.code === 100) {
-        throw new Error('Odoo session expired. Please reconnect from Dust.');
+        throw new OdooSessionExpiredError();
       }
       throw new Error(msg);
     }
@@ -216,7 +266,7 @@ class OdooClient {
     const resp = await axios.post(
       `${this.baseUrl}/jsonrpc`,
       { jsonrpc: '2.0', method: 'call', id: nextId(), params: { service: 'common', method: 'version', args: [] } },
-      { headers: { 'Content-Type': 'application/json' }, timeout: 10_000 },
+      { headers: { 'Content-Type': 'application/json' }, timeout: 10_000, maxRedirects: 0 },
     );
     if (resp.data.error) throw new Error(resp.data.error.message ?? 'Version check failed');
     return resp.data.result as Record<string, unknown>;
@@ -239,7 +289,7 @@ async function odooAuthenticate(url: string, db: string, username: string, passw
       jsonrpc: '2.0', method: 'call', id: nextId(),
       params: { db, login: username, password },
     },
-    { headers: { 'Content-Type': 'application/json' }, timeout: 10_000 },
+    { headers: { 'Content-Type': 'application/json' }, timeout: 10_000, maxRedirects: 0 },
   );
 
   if (resp.data.error) {
@@ -267,7 +317,7 @@ async function detectDb(url: string): Promise<string | null> {
     const resp = await axios.post(
       `${url.replace(/\/$/, '')}/web/database/list`,
       { jsonrpc: '2.0', method: 'call', id: nextId(), params: {} },
-      { headers: { 'Content-Type': 'application/json' }, timeout: 5_000 },
+      { headers: { 'Content-Type': 'application/json' }, timeout: 5_000, maxRedirects: 0 },
     );
     const dbs: string[] = resp.data.result as string[];
     if (Array.isArray(dbs) && dbs.length === 1) return dbs[0];
@@ -291,18 +341,26 @@ const tokenLimiter = rateLimit({ windowMs: 15 * 60_000, max: 60, standardHeaders
 
 /**
  * RFC 9728 — OAuth 2.0 Protected Resource Metadata
- * Registered at both the root path AND the /mcp suffix path.
+ * The `resource` field must exactly match the URL the client uses to connect.
+ * Dust users who configure https://host/ get resource=BASE_URL.
+ * Dust users who configure https://host/mcp get resource=BASE_URL/mcp.
  */
-const protectedResourceMetadata = (_req: Request, res: Response) => {
+app.get('/.well-known/oauth-protected-resource', (_req, res) => {
   res.json({
     resource: BASE_URL,
     authorization_servers: [BASE_URL],
     scopes_supported: ['odoo'],
     bearer_methods_supported: ['header'],
   });
-};
-app.get('/.well-known/oauth-protected-resource', protectedResourceMetadata);
-app.get('/.well-known/oauth-protected-resource/mcp', protectedResourceMetadata);
+});
+app.get('/.well-known/oauth-protected-resource/mcp', (_req, res) => {
+  res.json({
+    resource: `${BASE_URL}/mcp`,
+    authorization_servers: [BASE_URL],
+    scopes_supported: ['odoo'],
+    bearer_methods_supported: ['header'],
+  });
+});
 
 /** RFC 8414 — OAuth 2.0 Authorization Server Metadata */
 app.get('/.well-known/oauth-authorization-server', (_req, res) => {
@@ -322,7 +380,7 @@ app.get('/.well-known/oauth-authorization-server', (_req, res) => {
 app.post('/register', registerLimiter, (req, res) => {
   if (CLIENT_REGISTRATION_SECRET) {
     const auth = req.headers.authorization ?? '';
-    if (auth !== `Bearer ${CLIENT_REGISTRATION_SECRET}`) {
+    if (!safeCompare(auth, `Bearer ${CLIENT_REGISTRATION_SECRET}`)) {
       return res.status(401).json({ error: 'unauthorized', error_description: 'Invalid registration secret' });
     }
   }
@@ -364,46 +422,56 @@ app.get('/authorize', (req, res) => {
   pendingAuths.set(state, {
     clientId: client_id ?? '',
     redirectUri: redirect_uri,
-    state,
     codeChallenge: code_challenge,
     codeChallengeMethod: code_challenge_method ?? 'S256',
     createdAt: Date.now(),
   });
 
-  res.send(renderConnectForm(state));
+  res.set('X-Frame-Options', 'DENY')
+     .set('X-Content-Type-Options', 'nosniff')
+     .set('Content-Security-Policy', "default-src 'none'; style-src 'unsafe-inline'; script-src 'unsafe-inline'; form-action 'self'")
+     .send(renderConnectForm(state));
 });
 
 /** Handle the credential form submission */
 app.post('/authorize/submit', authLimiter, async (req, res) => {
   const { state, odoo_url, odoo_db, odoo_user, odoo_password } = req.body as Record<string, string>;
 
+  // Security headers on every form response
+  res.set('X-Frame-Options', 'DENY')
+     .set('X-Content-Type-Options', 'nosniff')
+     .set('Content-Security-Policy', "default-src 'none'; style-src 'unsafe-inline'; script-src 'unsafe-inline'; form-action 'self'");
+
+  const sendForm = (prefill?: { url?: string; db?: string; username?: string }, error?: string) =>
+    res.send(renderConnectForm(state, prefill, error));
+
   const pending = pendingAuths.get(state);
   if (!pending) {
     return res.status(400).send('<h2>Session expired or invalid. Please try connecting again from Dust.</h2>');
   }
 
-  const url = (odoo_url ?? '').trim().replace(/\/$/, '');
-  let db = (odoo_db ?? '').trim();
-  const username = (odoo_user ?? '').trim();
-  const password = (odoo_password ?? '').trim();
+  const url = (odoo_url ?? '').trim().replace(/\/$/, '').slice(0, 2048);
+  let db = (odoo_db ?? '').trim().slice(0, 255);
+  const username = (odoo_user ?? '').trim().slice(0, 255);
+  const password = (odoo_password ?? '').trim().slice(0, 1024);
 
   if (!url || !username || !password) {
-    return res.send(renderConnectForm(state, { url, db, username }, 'Odoo URL, email, and password are required.'));
+    return sendForm({ url, db, username }, 'Odoo URL, email, and password are required.');
   }
 
   // SSRF protection — block private/internal URLs
   if (isPrivateUrl(url)) {
-    return res.send(renderConnectForm(state, { url, db, username }, 'Invalid Odoo URL. Private or non-HTTP(S) URLs are not allowed.'));
+    return sendForm({ url, db, username }, 'Invalid Odoo URL. Private or non-HTTP(S) URLs are not allowed.');
   }
 
   try {
     if (!db) {
       const detected = await detectDb(url);
       if (!detected) {
-        return res.send(renderConnectForm(
-          state, { url, db, username },
+        return sendForm(
+          { url, db, username },
           'Could not auto-detect the database name. Please enter it manually.',
-        ));
+        );
       }
       db = detected;
     }
@@ -431,7 +499,7 @@ app.post('/authorize/submit', authLimiter, async (req, res) => {
 
   } catch (err: unknown) {
     const msg = extractErrorMessage(err, 'Authentication failed. Please check your credentials.');
-    res.send(renderConnectForm(state, { url, db, username }, msg));
+    sendForm({ url, db, username }, msg);
   }
 });
 
@@ -474,7 +542,7 @@ app.post('/token', tokenLimiter, (req, res) => {
   res.json({
     access_token: accessToken,
     token_type: 'Bearer',
-    expires_in: 86_400 * 30, // 30 days
+    expires_in: 86_400 * 365, // 1 year — session kept alive by server-side keepalive
     scope: 'odoo',
   });
 });
@@ -733,10 +801,17 @@ function mcpHandler(req: Request, res: Response): void {
   const stored = token ? accessTokens.get(token) : null;
   const ctx = stored?.ctx ?? null;
 
-  if (!ctx) {
+  const metadataPath = req.path === '/mcp'
+    ? `${BASE_URL}/.well-known/oauth-protected-resource/mcp`
+    : `${BASE_URL}/.well-known/oauth-protected-resource`;
+
+  const sendUnauthorized = (description: string) =>
     res.status(401)
-      .set('WWW-Authenticate', `Bearer resource_metadata="${BASE_URL}/.well-known/oauth-protected-resource"`)
-      .json({ error: 'unauthorized', error_description: 'Valid Bearer token required' });
+      .set('WWW-Authenticate', `Bearer resource_metadata="${metadataPath}"`)
+      .json({ error: 'unauthorized', error_description: description });
+
+  if (!ctx) {
+    sendUnauthorized('Valid Bearer token required');
     return;
   }
 
@@ -783,6 +858,12 @@ function mcpHandler(req: Request, res: Response): void {
           const result = await handleToolCall(name, args, client);
           ok({ content: [{ type: 'text', text: JSON.stringify(result, null, 2) }] });
         } catch (err: unknown) {
+          if (err instanceof OdooSessionExpiredError) {
+            // Remove the stale token and trigger Dust's OAuth reconnect flow
+            if (token) accessTokens.delete(token);
+            sendUnauthorized('Odoo session expired — please reconnect');
+            return;
+          }
           ok({
             content: [{ type: 'text', text: `Error: ${extractErrorMessage(err)}` }],
             isError: true,
