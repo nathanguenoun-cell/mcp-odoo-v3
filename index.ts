@@ -3,23 +3,29 @@
  *
  * A multi-user OAuth proxy MCP server that connects Dust (or any MCP client)
  * to Odoo via a native "Connect" button. Each user authenticates independently
- * with their own Odoo credentials (URL + API key).
+ * with their own Odoo credentials (URL + DB + username + password).
  *
  * Architecture:
- *   Dust ←→ [This server (OAuth proxy + MCP)] ←→ Odoo JSON-RPC
+ *   Dust ←→ [This server (OAuth proxy + MCP)] ←→ Odoo Web Session API
  *
  * OAuth flow implemented:
  *   RFC 9728: Protected Resource Metadata
  *   RFC 8414: Authorization Server Metadata
  *   RFC 7591: Dynamic Client Registration
- *   RFC 7636: PKCE
+ *   RFC 7636: PKCE (S256 only)
  *   The /authorize endpoint serves an HTML form to capture Odoo credentials,
  *   since Odoo has no standard OAuth2 authorization server.
+ *
+ * Odoo authentication:
+ *   Uses /web/session/authenticate to exchange login+password for a session
+ *   cookie once. The password is never stored — only the session cookie is
+ *   retained and replayed on subsequent /web/dataset/call_kw calls.
  */
 
 import express, { type Request, type Response } from 'express';
 import cors from 'cors';
 import axios from 'axios';
+import rateLimit from 'express-rate-limit';
 import { createHash, randomBytes } from 'crypto';
 import dotenv from 'dotenv';
 
@@ -28,14 +34,25 @@ dotenv.config();
 const app = express();
 const PORT = parseInt(process.env.PORT ?? '3000');
 
-// AUTO-DETECT BASE_URL:
-// 1. Explicit BASE_URL env var (recommended, highest priority)
-// 2. Railway's auto-set RAILWAY_PUBLIC_DOMAIN (works without any config on Railway)
-// 3. Local fallback
+// Optional pre-shared secret for the /register endpoint (RFC 7591 §3.4).
+// Set CLIENT_REGISTRATION_SECRET in .env to require it; leave empty to allow
+// unauthenticated registration (only safe in trusted private deployments).
+const CLIENT_REGISTRATION_SECRET = process.env.CLIENT_REGISTRATION_SECRET ?? '';
+
+// AUTO-DETECT BASE_URL
 function resolveBaseUrl(): string {
-  if (process.env.BASE_URL) return process.env.BASE_URL.replace(/\/$/, '');
-  if (process.env.RAILWAY_PUBLIC_DOMAIN) return `https://${process.env.RAILWAY_PUBLIC_DOMAIN}`;
-  return `http://localhost:${PORT}`;
+  let base =
+    process.env.BASE_URL ??
+    (process.env.RAILWAY_PUBLIC_DOMAIN ? `https://${process.env.RAILWAY_PUBLIC_DOMAIN}` : null) ??
+    `http://localhost:${PORT}`;
+
+  base = base.replace(/\/$/, '');
+
+  if (!base.startsWith('http://') && !base.startsWith('https://')) {
+    base = `https://${base}`;
+  }
+
+  return base;
 }
 const BASE_URL = resolveBaseUrl();
 
@@ -50,8 +67,7 @@ app.use(express.urlencoded({ extended: true }));
 interface OdooContext {
   url: string;
   db: string;
-  uid: number;
-  apiKey: string; // password or API key (used as RPC password)
+  sessionId: string; // Odoo web session cookie — password is never stored here
 }
 
 interface PendingAuth {
@@ -60,6 +76,7 @@ interface PendingAuth {
   state: string;
   codeChallenge: string;
   codeChallengeMethod: string;
+  createdAt: number;
 }
 
 interface AuthCode {
@@ -71,82 +88,138 @@ interface AuthCode {
   createdAt: number;
 }
 
-// ============================================================
-// IN-MEMORY STORES
-// Sufficient for most deployments — Dust re-authenticates on server restart.
-// ============================================================
-
-const registeredClients = new Map<string, { clientSecret: string; redirectUris: string[] }>();
-const pendingAuths = new Map<string, PendingAuth>();    // keyed by state
-const authCodes = new Map<string, AuthCode>();          // keyed by code
-const accessTokens = new Map<string, OdooContext>();    // keyed by bearer token
-
-// Expire old auth codes every 10 minutes
-setInterval(() => {
-  const cutoff = Date.now() - 600_000;
-  for (const [k, v] of authCodes) {
-    if (v.createdAt < cutoff) authCodes.delete(k);
-  }
-}, 600_000);
-
-// ============================================================
-// PKCE VERIFICATION (RFC 7636)
-// ============================================================
-
-function verifyPKCE(verifier: string, challenge: string, method: string): boolean {
-  if (method === 'S256') {
-    const hash = createHash('sha256').update(verifier).digest('base64url');
-    return hash === challenge;
-  }
-  return verifier === challenge; // 'plain'
+interface StoredToken {
+  ctx: OdooContext;
+  createdAt: number;
 }
 
 // ============================================================
-// ODOO JSON-RPC CLIENT
-// Uses the /jsonrpc endpoint (works on Odoo 14–18, self-hosted + SaaS).
-// Each call passes db + uid + apiKey — no web session required.
+// IN-MEMORY STORES
 // ============================================================
 
+const registeredClients = new Map<string, { clientSecret: string; redirectUris: string[] }>();
+const pendingAuths = new Map<string, PendingAuth>();   // keyed by state
+const authCodes = new Map<string, AuthCode>();         // keyed by code
+const accessTokens = new Map<string, StoredToken>();   // keyed by bearer token
+
+// Auth codes: 10-minute TTL. Interval runs every 2 min so the window is strict.
+setInterval(() => {
+  const cutoff = Date.now() - 10 * 60_000;
+  for (const [k, v] of authCodes) {
+    if (v.createdAt < cutoff) authCodes.delete(k);
+  }
+}, 2 * 60_000);
+
+// Pending auths: 15-minute TTL for abandoned flows.
+setInterval(() => {
+  const cutoff = Date.now() - 15 * 60_000;
+  for (const [k, v] of pendingAuths) {
+    if (v.createdAt < cutoff) pendingAuths.delete(k);
+  }
+}, 5 * 60_000);
+
+// Access tokens: 30-day TTL matching the expires_in we advertise.
+setInterval(() => {
+  const cutoff = Date.now() - 30 * 24 * 60 * 60_000;
+  for (const [k, v] of accessTokens) {
+    if (v.createdAt < cutoff) accessTokens.delete(k);
+  }
+}, 60 * 60_000);
+
+// ============================================================
+// SSRF PROTECTION
+// ============================================================
+
+function isPrivateUrl(urlStr: string): boolean {
+  try {
+    const u = new URL(urlStr);
+    if (u.protocol !== 'http:' && u.protocol !== 'https:') return true;
+    const h = u.hostname.toLowerCase();
+    if (h === 'localhost') return true;
+    if (h.endsWith('.local') || h.endsWith('.internal') || h.endsWith('.localhost')) return true;
+    const ipv4 = h.match(/^(\d{1,3})\.(\d{1,3})\.(\d{1,3})\.(\d{1,3})$/);
+    if (ipv4) {
+      const [a, b] = ipv4.slice(1).map(Number);
+      if (a === 10) return true;                          // 10.0.0.0/8
+      if (a === 172 && b >= 16 && b <= 31) return true;  // 172.16.0.0/12
+      if (a === 192 && b === 168) return true;            // 192.168.0.0/16
+      if (a === 127) return true;                         // 127.0.0.0/8
+      if (a === 169 && b === 254) return true;            // 169.254.0.0/16 (link-local / AWS metadata)
+      if (a === 0) return true;
+    }
+    return false;
+  } catch {
+    return true; // unparseable URL → block
+  }
+}
+
+// ============================================================
+// PKCE VERIFICATION (RFC 7636) — S256 only; plain is rejected
+// ============================================================
+
+function verifyPKCE(verifier: string, challenge: string, method: string): boolean {
+  if (method !== 'S256') return false;
+  const hash = createHash('sha256').update(verifier).digest('base64url');
+  return hash === challenge;
+}
+
+// ============================================================
+// ODOO WEB SESSION CLIENT
+//
+// Uses /web/session/authenticate to get a session cookie once,
+// then /web/dataset/call_kw with that cookie for all subsequent calls.
+// The login password is never stored — only the session cookie is retained.
+// ============================================================
+
+let rpcCounter = 0;
+function nextId(): number { return ++rpcCounter; }
+
 class OdooClient {
-  private readonly baseUrl: string;
   readonly db: string;
   readonly url: string;
+  private readonly baseUrl: string;
+  private readonly cookieHeader: string;
 
   constructor(private readonly ctx: OdooContext) {
     this.baseUrl = ctx.url.replace(/\/$/, '');
     this.db = ctx.db;
     this.url = ctx.url;
+    this.cookieHeader = `session_id=${ctx.sessionId}`;
   }
 
-  /** Low-level JSON-RPC call to /jsonrpc */
-  async rpc(service: string, method: string, args: unknown[]): Promise<unknown> {
-    const resp = await axios.post(
-      `${this.baseUrl}/jsonrpc`,
-      { jsonrpc: '2.0', method: 'call', id: Date.now(), params: { service, method, args } },
-      { headers: { 'Content-Type': 'application/json' }, timeout: 30_000 },
-    );
-    if (resp.data.error) {
-      const msg: string = (resp.data.error.data?.message as string) ?? (resp.data.error.message as string) ?? 'Odoo RPC error';
-      throw new Error(msg);
-    }
-    return resp.data.result;
-  }
-
-  /** Call a model method via execute_kw */
-  async executeKw(
+  async callKw(
     model: string,
     method: string,
     args: unknown[],
     kwargs: Record<string, unknown> = {},
   ): Promise<unknown> {
-    return this.rpc('object', 'execute_kw', [
-      this.ctx.db, this.ctx.uid, this.ctx.apiKey, model, method, args, kwargs,
-    ]);
+    const resp = await axios.post(
+      `${this.baseUrl}/web/dataset/call_kw`,
+      {
+        jsonrpc: '2.0', method: 'call', id: nextId(),
+        params: { model, method, args, kwargs: { context: {}, ...kwargs } },
+      },
+      { headers: { 'Content-Type': 'application/json', Cookie: this.cookieHeader }, timeout: 30_000 },
+    );
+    if (resp.data.error) {
+      const msg: string = resp.data.error.data?.message ?? resp.data.error.message ?? 'Odoo error';
+      // Surface session expiry clearly so the user knows to reconnect
+      if (msg.toLowerCase().includes('session') || resp.data.error.code === 100) {
+        throw new Error('Odoo session expired. Please reconnect from Dust.');
+      }
+      throw new Error(msg);
+    }
+    return resp.data.result;
   }
 
-  /** Get Odoo server version info */
   async serverVersion(): Promise<Record<string, unknown>> {
-    return this.rpc('common', 'version', []) as Promise<Record<string, unknown>>;
+    const resp = await axios.post(
+      `${this.baseUrl}/jsonrpc`,
+      { jsonrpc: '2.0', method: 'call', id: nextId(), params: { service: 'common', method: 'version', args: [] } },
+      { headers: { 'Content-Type': 'application/json' }, timeout: 10_000 },
+    );
+    if (resp.data.error) throw new Error(resp.data.error.message ?? 'Version check failed');
+    return resp.data.result as Record<string, unknown>;
   }
 }
 
@@ -154,26 +227,38 @@ class OdooClient {
 // ODOO AUTHENTICATION HELPERS
 // ============================================================
 
-/** Authenticate with Odoo JSON-RPC and return the UID. */
-async function odooAuthenticate(url: string, db: string, username: string, apiKey: string): Promise<number> {
+/**
+ * Authenticate with Odoo's web session API and return the session cookie.
+ * The password is used here and immediately discarded — it is never stored.
+ */
+async function odooAuthenticate(url: string, db: string, username: string, password: string): Promise<string> {
   const baseUrl = url.replace(/\/$/, '');
   const resp = await axios.post(
-    `${baseUrl}/jsonrpc`,
+    `${baseUrl}/web/session/authenticate`,
     {
-      jsonrpc: '2.0', method: 'call', id: 1,
-      params: { service: 'common', method: 'authenticate', args: [db, username, apiKey, {}] },
+      jsonrpc: '2.0', method: 'call', id: nextId(),
+      params: { db, login: username, password },
     },
     { headers: { 'Content-Type': 'application/json' }, timeout: 10_000 },
   );
 
   if (resp.data.error) {
-    const msg: string = (resp.data.error.data?.message as string) ?? 'Authentication failed';
+    const msg: string = resp.data.error.data?.message ?? 'Authentication failed';
     throw new Error(msg);
   }
 
-  const uid: number = resp.data.result as number;
-  if (!uid) throw new Error('Invalid credentials — authentication returned UID=0. Check your username and API key/password.');
-  return uid;
+  const uid: number = resp.data.result?.uid as number;
+  if (!uid) throw new Error('Invalid credentials — check your username and password.');
+
+  // Extract session_id from Set-Cookie response header
+  const setCookie = resp.headers['set-cookie'];
+  const cookies = Array.isArray(setCookie) ? setCookie : [setCookie ?? ''];
+  for (const c of cookies) {
+    const m = c?.match(/session_id=([^;]+)/);
+    if (m) return m[1];
+  }
+
+  throw new Error('Odoo did not return a session cookie. Check that the server URL is correct.');
 }
 
 /** Try to auto-detect the database name (works when only 1 DB exists). */
@@ -181,7 +266,7 @@ async function detectDb(url: string): Promise<string | null> {
   try {
     const resp = await axios.post(
       `${url.replace(/\/$/, '')}/web/database/list`,
-      { jsonrpc: '2.0', method: 'call', id: 1, params: {} },
+      { jsonrpc: '2.0', method: 'call', id: nextId(), params: {} },
       { headers: { 'Content-Type': 'application/json' }, timeout: 5_000 },
     );
     const dbs: string[] = resp.data.result as string[];
@@ -193,15 +278,20 @@ async function detectDb(url: string): Promise<string | null> {
 }
 
 // ============================================================
-// OAUTH ENDPOINTS — these give Dust the native "Connect" button
+// RATE LIMITERS
+// ============================================================
+
+const registerLimiter = rateLimit({ windowMs: 60 * 60_000, max: 30, standardHeaders: true, legacyHeaders: false });
+const authLimiter = rateLimit({ windowMs: 15 * 60_000, max: 20, standardHeaders: true, legacyHeaders: false });
+const tokenLimiter = rateLimit({ windowMs: 15 * 60_000, max: 60, standardHeaders: true, legacyHeaders: false });
+
+// ============================================================
+// OAUTH ENDPOINTS
 // ============================================================
 
 /**
  * RFC 9728 — OAuth 2.0 Protected Resource Metadata
  * Registered at both the root path AND the /mcp suffix path.
- * When a user enters https://host/mcp in Dust, Dust constructs the well-known
- * URL as /.well-known/oauth-protected-resource/mcp (RFC 9728 §2, path-based
- * discovery appends the resource path). Both variants must return valid metadata.
  */
 const protectedResourceMetadata = (_req: Request, res: Response) => {
   res.json({
@@ -224,12 +314,19 @@ app.get('/.well-known/oauth-authorization-server', (_req, res) => {
     scopes_supported: ['odoo'],
     response_types_supported: ['code'],
     grant_types_supported: ['authorization_code'],
-    code_challenge_methods_supported: ['S256', 'plain'],
+    code_challenge_methods_supported: ['S256'], // plain removed — insecure per RFC 9700
   });
 });
 
 /** RFC 7591 — Dynamic Client Registration */
-app.post('/register', (req, res) => {
+app.post('/register', registerLimiter, (req, res) => {
+  if (CLIENT_REGISTRATION_SECRET) {
+    const auth = req.headers.authorization ?? '';
+    if (auth !== `Bearer ${CLIENT_REGISTRATION_SECRET}`) {
+      return res.status(401).json({ error: 'unauthorized', error_description: 'Invalid registration secret' });
+    }
+  }
+
   const { redirect_uris = [], client_name } = req.body as { redirect_uris?: string[]; client_name?: string };
   const clientId = randomBytes(16).toString('hex');
   const clientSecret = randomBytes(32).toString('hex');
@@ -248,7 +345,7 @@ app.post('/register', (req, res) => {
 /**
  * Authorization endpoint — serves an HTML credential form.
  * Odoo has no standard OAuth2 flow, so we capture credentials directly
- * and validate them against the Odoo JSON-RPC authenticate endpoint.
+ * and validate them against Odoo's session API.
  */
 app.get('/authorize', (req, res) => {
   const q = req.query as Record<string, string>;
@@ -258,20 +355,27 @@ app.get('/authorize', (req, res) => {
     return res.status(400).send('<h2>Missing required OAuth parameters (state, redirect_uri, code_challenge).</h2>');
   }
 
+  // Validate redirect_uri against the registered client's allowed URIs
+  const client = registeredClients.get(client_id ?? '');
+  if (client && !client.redirectUris.includes(redirect_uri)) {
+    return res.status(400).send('<h2>redirect_uri is not registered for this client.</h2>');
+  }
+
   pendingAuths.set(state, {
     clientId: client_id ?? '',
     redirectUri: redirect_uri,
     state,
     codeChallenge: code_challenge,
     codeChallengeMethod: code_challenge_method ?? 'S256',
+    createdAt: Date.now(),
   });
 
   res.send(renderConnectForm(state));
 });
 
 /** Handle the credential form submission */
-app.post('/authorize/submit', async (req, res) => {
-  const { state, odoo_url, odoo_db, odoo_user, odoo_apikey } = req.body as Record<string, string>;
+app.post('/authorize/submit', authLimiter, async (req, res) => {
+  const { state, odoo_url, odoo_db, odoo_user, odoo_password } = req.body as Record<string, string>;
 
   const pending = pendingAuths.get(state);
   if (!pending) {
@@ -281,14 +385,18 @@ app.post('/authorize/submit', async (req, res) => {
   const url = (odoo_url ?? '').trim().replace(/\/$/, '');
   let db = (odoo_db ?? '').trim();
   const username = (odoo_user ?? '').trim();
-  const apiKey = (odoo_apikey ?? '').trim();
+  const password = (odoo_password ?? '').trim();
 
-  if (!url || !username || !apiKey) {
-    return res.send(renderConnectForm(state, { url, db, username }, 'Odoo URL, email, and API key are required.'));
+  if (!url || !username || !password) {
+    return res.send(renderConnectForm(state, { url, db, username }, 'Odoo URL, email, and password are required.'));
+  }
+
+  // SSRF protection — block private/internal URLs
+  if (isPrivateUrl(url)) {
+    return res.send(renderConnectForm(state, { url, db, username }, 'Invalid Odoo URL. Private or non-HTTP(S) URLs are not allowed.'));
   }
 
   try {
-    // Auto-detect database when not provided
     if (!db) {
       const detected = await detectDb(url);
       if (!detected) {
@@ -300,11 +408,10 @@ app.post('/authorize/submit', async (req, res) => {
       db = detected;
     }
 
-    // Validate credentials against Odoo
-    const uid = await odooAuthenticate(url, db, username, apiKey);
-    const odooCtx: OdooContext = { url, db, uid, apiKey };
+    // Authenticate — password is used once here and immediately discarded
+    const sessionId = await odooAuthenticate(url, db, username, password);
+    const odooCtx: OdooContext = { url, db, sessionId };
 
-    // Store auth code (contains the pending PKCE info for /token verification)
     const code = randomBytes(32).toString('hex');
     authCodes.set(code, {
       clientId: pending.clientId,
@@ -317,7 +424,6 @@ app.post('/authorize/submit', async (req, res) => {
 
     pendingAuths.delete(state);
 
-    // Always redirect back to Dust — never show a debug page here
     const redirectUrl = new URL(pending.redirectUri);
     redirectUrl.searchParams.set('code', code);
     redirectUrl.searchParams.set('state', state);
@@ -330,8 +436,8 @@ app.post('/authorize/submit', async (req, res) => {
 });
 
 /** Token endpoint — exchanges auth code for bearer token */
-app.post('/token', (req, res) => {
-  const { grant_type, code, code_verifier } = req.body as Record<string, string>;
+app.post('/token', tokenLimiter, (req, res) => {
+  const { grant_type, code, code_verifier, client_id, client_secret } = req.body as Record<string, string>;
 
   if (grant_type !== 'authorization_code') {
     return res.status(400).json({ error: 'unsupported_grant_type' });
@@ -342,15 +448,27 @@ app.post('/token', (req, res) => {
     return res.status(400).json({ error: 'invalid_grant', error_description: 'Invalid or expired authorization code' });
   }
 
-  // PKCE verification
-  if (code_verifier) {
-    if (!verifyPKCE(code_verifier, authCode.codeChallenge, authCode.codeChallengeMethod)) {
-      return res.status(400).json({ error: 'invalid_grant', error_description: 'PKCE verification failed' });
+  // Validate client credentials when the client is registered
+  const client = registeredClients.get(client_id ?? '');
+  if (client) {
+    if (client_id !== authCode.clientId || client.clientSecret !== client_secret) {
+      authCodes.delete(code);
+      return res.status(401).json({ error: 'invalid_client', error_description: 'Invalid client credentials' });
     }
   }
 
+  // PKCE is mandatory — reject requests without code_verifier
+  if (!code_verifier) {
+    authCodes.delete(code);
+    return res.status(400).json({ error: 'invalid_grant', error_description: 'code_verifier is required' });
+  }
+  if (!verifyPKCE(code_verifier, authCode.codeChallenge, authCode.codeChallengeMethod)) {
+    authCodes.delete(code);
+    return res.status(400).json({ error: 'invalid_grant', error_description: 'PKCE verification failed' });
+  }
+
   const accessToken = randomBytes(32).toString('hex');
-  accessTokens.set(accessToken, authCode.odooCtx);
+  accessTokens.set(accessToken, { ctx: authCode.odooCtx, createdAt: Date.now() });
   authCodes.delete(code);
 
   res.json({
@@ -418,7 +536,7 @@ const MCP_TOOLS = [
         model: { type: 'string', description: 'Odoo model name' },
         values: {
           type: 'object',
-          description: "Field values for the new record. Example: {\"name\": \"ACME Corp\", \"is_company\": true}",
+          description: 'Field values for the new record. Example: {"name": "ACME Corp", "is_company": true}',
         },
       },
       required: ['model', 'values'],
@@ -434,7 +552,7 @@ const MCP_TOOLS = [
         id: { type: 'number', description: 'Record ID to update' },
         values: {
           type: 'object',
-          description: "Fields and new values. Example: {\"email\": \"new@email.com\", \"phone\": \"+1 555 0100\"}",
+          description: 'Fields and new values. Example: {"email": "new@email.com", "phone": "+1 555 0100"}',
         },
       },
       required: ['model', 'id', 'values'],
@@ -454,7 +572,7 @@ const MCP_TOOLS = [
   },
   {
     name: 'list_models',
-    description: 'List all available Odoo models (technical models) accessible with the current user permissions.',
+    description: 'List all available Odoo models accessible with the current user permissions.',
     inputSchema: {
       type: 'object',
       properties: {
@@ -523,8 +641,8 @@ async function handleToolCall(
       const kwargs: Record<string, unknown> = { limit: Math.min(limit, 1000), offset };
       if ((fields as string[]).length > 0) kwargs.fields = fields;
       if (order) kwargs.order = order;
-      const records = await client.executeKw(model, 'search_read', [domain], kwargs);
-      const total = await client.executeKw(model, 'search_count', [domain], {});
+      const records = await client.callKw(model, 'search_read', [domain], kwargs);
+      const total = await client.callKw(model, 'search_count', [domain], {});
       return { records, total, limit, offset };
     }
 
@@ -532,26 +650,26 @@ async function handleToolCall(
       const { model, id, fields = [] } = input as { model: string; id: number; fields?: string[] };
       const kwargs: Record<string, unknown> = {};
       if ((fields as string[]).length > 0) kwargs.fields = fields;
-      const records = await client.executeKw(model, 'read', [[id]], kwargs) as unknown[];
+      const records = await client.callKw(model, 'read', [[id]], kwargs) as unknown[];
       if (!records || records.length === 0) throw new Error(`Record ${id} not found in model "${model}"`);
-      return (records as unknown[])[0];
+      return records[0];
     }
 
     case 'create_record': {
       const { model, values } = input as { model: string; values: Record<string, unknown> };
-      const id = await client.executeKw(model, 'create', [values], {}) as number;
+      const id = await client.callKw(model, 'create', [values], {}) as number;
       return { id, success: true, message: `Created ${model} record with ID ${id}` };
     }
 
     case 'update_record': {
       const { model, id, values } = input as { model: string; id: number; values: Record<string, unknown> };
-      await client.executeKw(model, 'write', [[id], values], {});
+      await client.callKw(model, 'write', [[id], values], {});
       return { success: true, message: `Updated ${model} record ${id}` };
     }
 
     case 'delete_record': {
       const { model, id } = input as { model: string; id: number };
-      await client.executeKw(model, 'unlink', [[id]], {});
+      await client.callKw(model, 'unlink', [[id]], {});
       return { success: true, message: `Deleted ${model} record ${id}` };
     }
 
@@ -560,7 +678,7 @@ async function handleToolCall(
       const domain: unknown[] = filter
         ? ['|', ['model', 'ilike', filter], ['name', 'ilike', filter]]
         : [];
-      const models = await client.executeKw('ir.model', 'search_read', [domain], {
+      const models = await client.callKw('ir.model', 'search_read', [domain], {
         fields: ['model', 'name', 'info'],
         order: 'model asc',
         limit: Math.min(limit, 500),
@@ -570,7 +688,7 @@ async function handleToolCall(
 
     case 'get_fields': {
       const { model } = input as { model: string };
-      const fields = await client.executeKw(model, 'fields_get', [], {
+      const fields = await client.callKw(model, 'fields_get', [], {
         attributes: ['string', 'type', 'required', 'readonly', 'help', 'selection', 'relation'],
       });
       return { model, fields };
@@ -591,7 +709,7 @@ async function handleToolCall(
       const { model, method, args = [], kwargs = {} } = input as {
         model: string; method: string; args?: unknown[]; kwargs?: Record<string, unknown>;
       };
-      const result = await client.executeKw(model, method, args as unknown[], kwargs);
+      const result = await client.callKw(model, method, args as unknown[], kwargs);
       return { result };
     }
 
@@ -602,8 +720,6 @@ async function handleToolCall(
 
 // ============================================================
 // MCP HTTP HANDLER
-// Implements the MCP protocol over HTTP POST manually (no SDK transport).
-// Bearer token → OdooContext lookup → execute tool.
 // ============================================================
 
 function extractBearerToken(req: Request): string | null {
@@ -613,9 +729,9 @@ function extractBearerToken(req: Request): string | null {
 }
 
 function mcpHandler(req: Request, res: Response): void {
-  // Unauthenticated requests → 401 with WWW-Authenticate (triggers Dust Connect button)
   const token = extractBearerToken(req);
-  const ctx = token ? accessTokens.get(token) : null;
+  const stored = token ? accessTokens.get(token) : null;
+  const ctx = stored?.ctx ?? null;
 
   if (!ctx) {
     res.status(401)
@@ -624,7 +740,6 @@ function mcpHandler(req: Request, res: Response): void {
     return;
   }
 
-  // GET requests — connectivity check
   if (req.method === 'GET') {
     res.json({ status: 'ok', server: 'odoo-mcp-oauth', version: '1.0.0' });
     return;
@@ -632,7 +747,6 @@ function mcpHandler(req: Request, res: Response): void {
 
   const { method, params, id } = req.body as { method: string; params?: Record<string, unknown>; id?: unknown };
 
-  // Notifications have no id — just ack them
   if (id === undefined) {
     res.status(204).send();
     return;
@@ -686,12 +800,10 @@ function mcpHandler(req: Request, res: Response): void {
   });
 }
 
-// MCP served at both / and /mcp (Dust uses base URL /)
 app.all('/mcp', mcpHandler);
 app.all('/', mcpHandler);
 
-// Health check endpoint
-app.get('/health', (_req, res) => res.json({ status: 'ok', connectedUsers: accessTokens.size }));
+app.get('/health', (_req, res) => res.json({ status: 'ok' }));
 
 // ============================================================
 // HELPERS
@@ -700,7 +812,6 @@ app.get('/health', (_req, res) => res.json({ status: 'ok', connectedUsers: acces
 function extractErrorMessage(err: unknown, fallback = 'An unknown error occurred'): string {
   if (err instanceof Error) return err.message;
   if (typeof err === 'string') return err;
-  // axios error with Odoo error body
   const e = err as { response?: { data?: { error?: { data?: { message?: string }; message?: string } } }; message?: string };
   return e?.response?.data?.error?.data?.message
     ?? e?.response?.data?.error?.message
@@ -779,9 +890,8 @@ function renderConnectForm(
       <input type="email" id="usr" name="odoo_user" placeholder="admin@mycompany.com" value="${esc(prefill.username ?? '')}" required autocomplete="email">
     </div>
     <div class="field">
-      <label for="key">API Key or Password</label>
-      <input type="password" id="key" name="odoo_apikey" required autocomplete="current-password">
-      <p class="hint">Generate an API key: Odoo Settings → Users → Your profile → API Keys tab. Using API keys is more secure than passwords.</p>
+      <label for="pwd">Password</label>
+      <input type="password" id="pwd" name="odoo_password" required autocomplete="current-password">
     </div>
 
     <button class="btn" type="submit" id="btn">Connect to Odoo</button>
@@ -804,7 +914,7 @@ function renderConnectForm(
 
 app.listen(PORT, () => {
   console.log(`\nOdoo MCP OAuth Server`);
-  console.log(`  MCP endpoint : ${BASE_URL}/`);
-  console.log(`  OAuth discovery : ${BASE_URL}/.well-known/oauth-authorization-server`);
-  console.log(`  Health : ${BASE_URL}/health\n`);
+  console.log(`  MCP endpoint      : ${BASE_URL}/`);
+  console.log(`  OAuth discovery   : ${BASE_URL}/.well-known/oauth-authorization-server`);
+  console.log(`  Health            : ${BASE_URL}/health\n`);
 });
