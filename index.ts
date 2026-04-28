@@ -400,32 +400,11 @@ app.post('/register', registerLimiter, (req, res) => {
   });
 });
 
-/**
- * Authorization endpoint — serves an HTML credential form.
- * Handles two scenarios:
- *   1. Initial OAuth flow (redirect_uri present) — stores pending auth, shows form.
- *   2. PRG retry (redirect_uri absent, state already registered) — re-shows form with
- *      error/prefill from query params after a failed credential attempt.
- *
- * The PRG (Post-Redirect-Get) pattern ensures retries are always GET requests,
- * which avoids browser "confirm resubmission" issues and keeps history clean.
- */
+/** Authorization endpoint — serves an HTML credential form. */
 app.get('/authorize', (req, res) => {
   const q = req.query as Record<string, string>;
   const { state, redirect_uri, client_id, code_challenge, code_challenge_method } = q;
 
-  const renderForm = (err?: string) =>
-    res.set('X-Frame-Options', 'DENY')
-       .set('X-Content-Type-Options', 'nosniff')
-       .set('Content-Security-Policy', "default-src 'none'; style-src 'unsafe-inline'; script-src 'unsafe-inline'; form-action 'self'")
-       .send(renderConnectForm(state, { url: q.url, db: q.db, username: q.username }, err));
-
-  // PRG retry: state already registered, coming back after a failed credential attempt
-  if (state && pendingAuths.has(state) && !redirect_uri) {
-    return renderForm(q.error);
-  }
-
-  // Normal OAuth init flow
   if (!state || !redirect_uri || !code_challenge) {
     return res.status(400).send('<h2>Missing required OAuth parameters (state, redirect_uri, code_challenge).</h2>');
   }
@@ -443,7 +422,10 @@ app.get('/authorize', (req, res) => {
     createdAt: Date.now(),
   });
 
-  renderForm();
+  res.set('X-Frame-Options', 'DENY')
+     .set('X-Content-Type-Options', 'nosniff')
+     .set('Content-Security-Policy', "default-src 'none'; style-src 'unsafe-inline'; script-src 'unsafe-inline'; form-action 'self'")
+     .send(renderConnectForm(state));
 });
 
 /** Handle the credential form submission */
@@ -460,31 +442,27 @@ app.post('/authorize/submit', authLimiter, async (req, res) => {
   const username = (odoo_user ?? '').trim().slice(0, 255);
   const password = (odoo_password ?? '').trim().slice(0, 1024);
 
-  // PRG: redirect back to GET /authorize with error + prefill so retries always use GET
-  const redirectError = (msg: string, keepUrl = true) => {
-    const u = new URL(`${BASE_URL}/authorize`);
-    u.searchParams.set('state', state);
-    u.searchParams.set('error', msg);
-    if (keepUrl && url) u.searchParams.set('url', url);
-    if (keepUrl && db) u.searchParams.set('db', db);
-    if (keepUrl && username) u.searchParams.set('username', username);
-    return res.redirect(u.toString());
-  };
+  // Re-render the form in-place with an error message — no redirect (Dust intercepts 302s)
+  const sendForm = (err?: string) =>
+    res.set('X-Frame-Options', 'DENY')
+       .set('X-Content-Type-Options', 'nosniff')
+       .set('Content-Security-Policy', "default-src 'none'; style-src 'unsafe-inline'; script-src 'unsafe-inline'; form-action 'self'")
+       .send(renderConnectForm(state, { url, db, username }, err));
 
   if (!url || !username || !password) {
-    return redirectError('Odoo URL, email, and password are required.');
+    return sendForm('Odoo URL, email, and password are required.');
   }
 
   // SSRF protection — block private/internal URLs (don't reflect the URL back)
   if (isPrivateUrl(url)) {
-    return redirectError('Invalid Odoo URL. Private or non-HTTP(S) URLs are not allowed.', false);
+    return sendForm('Invalid Odoo URL. Private or non-HTTP(S) URLs are not allowed.');
   }
 
   try {
     if (!db) {
       const detected = await detectDb(url);
       if (!detected) {
-        return redirectError('Could not auto-detect the database name. Please enter it manually.');
+        return sendForm('Could not auto-detect the database name. Please enter it manually.');
       }
       db = detected;
     }
@@ -512,7 +490,7 @@ app.post('/authorize/submit', authLimiter, async (req, res) => {
 
   } catch (err: unknown) {
     const msg = extractErrorMessage(err, 'Authentication failed. Please check your credentials.');
-    redirectError(msg);
+    sendForm(msg);
   }
 });
 
