@@ -27,6 +27,7 @@ import cors from 'cors';
 import axios from 'axios';
 import rateLimit from 'express-rate-limit';
 import { createHash, randomBytes, timingSafeEqual } from 'crypto';
+import { existsSync, mkdirSync, readFileSync, writeFileSync } from 'fs';
 import dotenv from 'dotenv';
 
 dotenv.config();
@@ -101,6 +102,53 @@ const registeredClients = new Map<string, { clientSecret: string; redirectUris: 
 const pendingAuths = new Map<string, PendingAuth>();   // keyed by state
 const authCodes = new Map<string, AuthCode>();         // keyed by code
 const accessTokens = new Map<string, StoredToken>();   // keyed by bearer token
+
+// ============================================================
+// TOKEN PERSISTENCE (Railway Volume at /data)
+// ============================================================
+// Only accessTokens need to survive restarts — pendingAuths and authCodes
+// are short-lived (≤15 min TTL) and are intentionally not persisted.
+
+const DATA_DIR = process.env.DATA_DIR ?? '/data';
+const TOKENS_FILE = `${DATA_DIR}/tokens.json`;
+
+function loadTokens(): void {
+  try {
+    if (!existsSync(TOKENS_FILE)) return;
+    const raw = readFileSync(TOKENS_FILE, 'utf8');
+    const entries = JSON.parse(raw) as Array<[string, StoredToken]>;
+    const cutoff = Date.now() - 365 * 24 * 60 * 60_000;
+    let loaded = 0;
+    for (const [token, stored] of entries) {
+      if (stored.createdAt > cutoff) {
+        accessTokens.set(token, stored);
+        loaded++;
+      }
+    }
+    if (loaded > 0) console.log(`Restored ${loaded} session(s) from disk.`);
+  } catch (err) {
+    console.warn('Could not load tokens from disk (starting fresh):', err);
+  }
+}
+
+function saveTokens(): void {
+  try {
+    mkdirSync(DATA_DIR, { recursive: true });
+    writeFileSync(TOKENS_FILE, JSON.stringify([...accessTokens.entries()]), 'utf8');
+  } catch (err) {
+    console.warn('Could not save tokens to disk:', err);
+  }
+}
+
+// Restore sessions immediately on startup
+loadTokens();
+
+// Periodic save every 5 minutes — guards against hard crashes (SIGKILL, OOM)
+setInterval(() => saveTokens(), 5 * 60_000);
+
+// Graceful shutdown: Railway sends SIGTERM before stopping the container
+process.on('SIGTERM', () => { saveTokens(); process.exit(0); });
+process.on('SIGINT',  () => { saveTokens(); process.exit(0); });
 
 // Auth codes: 10-minute TTL. Interval runs every 2 min so the window is strict.
 setInterval(() => {
