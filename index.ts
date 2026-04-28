@@ -301,10 +301,16 @@ class OdooClient {
     );
     if (resp.data.error) {
       const msg: string = resp.data.error.data?.message ?? resp.data.error.message ?? 'Odoo error';
-      // Surface session expiry clearly so the user knows to reconnect
-      if (msg.toLowerCase().includes('session') || resp.data.error.code === 100) {
-        throw new OdooSessionExpiredError();
-      }
+      // Detect session expiry by error code (100 = Odoo session invalid) or known
+      // exact phrases — intentionally narrow to avoid false positives on business
+      // errors that happen to mention the word "session".
+      const lmsg = msg.toLowerCase();
+      const isSessionError =
+        resp.data.error.code === 100 ||
+        lmsg.includes('session invalid') ||
+        lmsg.includes('session expired') ||
+        lmsg === 'odoo session invalid';
+      if (isSessionError) throw new OdooSessionExpiredError();
       throw new Error(msg);
     }
     return resp.data.result;
@@ -379,20 +385,16 @@ async function detectDb(url: string): Promise<string | null> {
 // RATE LIMITERS
 // ============================================================
 
-const registerLimiter = rateLimit({ windowMs: 60 * 60_000, max: 30, standardHeaders: true, legacyHeaders: false });
-const authLimiter = rateLimit({ windowMs: 15 * 60_000, max: 20, standardHeaders: true, legacyHeaders: false });
-const tokenLimiter = rateLimit({ windowMs: 15 * 60_000, max: 60, standardHeaders: true, legacyHeaders: false });
+const registerLimiter = rateLimit({ windowMs: 60 * 60_000, max: 30,  standardHeaders: true, legacyHeaders: false });
+const authLimiter    = rateLimit({ windowMs: 15 * 60_000, max: 20,  standardHeaders: true, legacyHeaders: false });
+const tokenLimiter   = rateLimit({ windowMs: 15 * 60_000, max: 60,  standardHeaders: true, legacyHeaders: false });
+// Per-IP limit on MCP calls — prevents a compromised token from flooding Odoo
+const mcpLimiter     = rateLimit({ windowMs: 15 * 60_000, max: 300, standardHeaders: true, legacyHeaders: false });
 
 // ============================================================
 // OAUTH ENDPOINTS
 // ============================================================
 
-/**
- * RFC 9728 — OAuth 2.0 Protected Resource Metadata
- * The `resource` field must exactly match the URL the client uses to connect.
- * Dust users who configure https://host/ get resource=BASE_URL.
- * Dust users who configure https://host/mcp get resource=BASE_URL/mcp.
- */
 // RFC 9728 — single canonical resource matching BASE_URL.
 // Both / and /mcp point to this same resource_metadata so Dust sees
 // only one OAuth resource and creates exactly one MCP connection.
@@ -444,7 +446,7 @@ app.post('/register', registerLimiter, (req, res) => {
 });
 
 /** Authorization endpoint — serves an HTML credential form. */
-app.get('/authorize', (req, res) => {
+app.get('/authorize', authLimiter, (req, res) => {
   const q = req.query as Record<string, string>;
   const { state, redirect_uri, client_id, code_challenge, code_challenge_method } = q;
 
@@ -607,6 +609,7 @@ const MCP_TOOLS = [
         limit: { type: 'number', description: 'Max records to return (default: 10, max: 1000)', default: 10 },
         offset: { type: 'number', description: 'Number of records to skip for pagination (default: 0)', default: 0 },
         order: { type: 'string', description: "Sort order. Example: 'name asc' or 'date_order desc'" },
+        include_total: { type: 'boolean', description: 'Whether to fetch the total record count (requires an extra Odoo call). Default: false', default: false },
       },
       required: ['model'],
     },
@@ -737,15 +740,16 @@ async function handleToolCall(
 ): Promise<unknown> {
   switch (toolName) {
     case 'search_records': {
-      const { model, domain = [], fields = [], limit = 10, offset = 0, order } = input as {
-        model: string; domain?: unknown[]; fields?: string[]; limit?: number; offset?: number; order?: string;
+      const { model, domain = [], fields = [], limit = 10, offset = 0, order, include_total = false } = input as {
+        model: string; domain?: unknown[]; fields?: string[]; limit?: number; offset?: number; order?: string; include_total?: boolean;
       };
       const kwargs: Record<string, unknown> = { limit: Math.min(limit, 1000), offset };
       if ((fields as string[]).length > 0) kwargs.fields = fields;
       if (order) kwargs.order = order;
       const records = await client.callKw(model, 'search_read', [domain], kwargs);
-      const total = await client.callKw(model, 'search_count', [domain], {});
-      return { records, total, limit, offset };
+      // total requires a second Odoo call — only fetch when explicitly requested
+      const total = include_total ? await client.callKw(model, 'search_count', [domain], {}) : undefined;
+      return { records, ...(total !== undefined ? { total } : {}), limit, offset };
     }
 
     case 'get_record': {
@@ -811,6 +815,11 @@ async function handleToolCall(
       const { model, method, args = [], kwargs = {} } = input as {
         model: string; method: string; args?: unknown[]; kwargs?: Record<string, unknown>;
       };
+      // Block private/internal Odoo methods (prefixed with _) — these are never
+      // part of the public API and could expose dangerous low-level operations.
+      if (method.startsWith('_')) {
+        throw new Error(`Method "${method}" is private and cannot be called via MCP.`);
+      }
       const result = await client.callKw(model, method, args as unknown[], kwargs);
       return { result };
     }
@@ -851,7 +860,7 @@ function mcpHandler(req: Request, res: Response): void {
   }
 
   if (req.method === 'GET') {
-    res.json({ status: 'ok', server: 'odoo-mcp-oauth', version: '1.0.0' });
+    res.status(405).set('Allow', 'POST').json({ error: 'method_not_allowed', error_description: 'MCP requires POST requests' });
     return;
   }
 
@@ -916,7 +925,7 @@ function mcpHandler(req: Request, res: Response): void {
   });
 }
 
-app.all('/mcp', mcpHandler);
+app.all('/mcp', mcpLimiter, mcpHandler);
 
 // GET / is a public status page — intentionally no auth required.
 // Previously app.all('/', mcpHandler) caused Dust to see / and /mcp as two
@@ -1035,7 +1044,7 @@ function renderConnectForm(
 
 app.listen(PORT, () => {
   console.log(`\nOdoo MCP OAuth Server`);
-  console.log(`  MCP endpoint      : ${BASE_URL}/`);
+  console.log(`  MCP endpoint      : ${BASE_URL}/mcp`);
   console.log(`  OAuth discovery   : ${BASE_URL}/.well-known/oauth-authorization-server`);
   console.log(`  Health            : ${BASE_URL}/health\n`);
 });
