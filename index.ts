@@ -345,17 +345,12 @@ const tokenLimiter = rateLimit({ windowMs: 15 * 60_000, max: 60, standardHeaders
  * Dust users who configure https://host/ get resource=BASE_URL.
  * Dust users who configure https://host/mcp get resource=BASE_URL/mcp.
  */
+// RFC 9728 — single canonical resource matching BASE_URL.
+// Both / and /mcp point to this same resource_metadata so Dust sees
+// only one OAuth resource and creates exactly one MCP connection.
 app.get('/.well-known/oauth-protected-resource', (_req, res) => {
   res.json({
     resource: BASE_URL,
-    authorization_servers: [BASE_URL],
-    scopes_supported: ['odoo'],
-    bearer_methods_supported: ['header'],
-  });
-});
-app.get('/.well-known/oauth-protected-resource/mcp', (_req, res) => {
-  res.json({
-    resource: `${BASE_URL}/mcp`,
     authorization_servers: [BASE_URL],
     scopes_supported: ['odoo'],
     bearer_methods_supported: ['header'],
@@ -792,9 +787,10 @@ function mcpHandler(req: Request, res: Response): void {
   const stored = token ? accessTokens.get(token) : null;
   const ctx = stored?.ctx ?? null;
 
-  const metadataPath = req.path === '/mcp'
-    ? `${BASE_URL}/.well-known/oauth-protected-resource/mcp`
-    : `${BASE_URL}/.well-known/oauth-protected-resource`;
+  // Always use the same resource_metadata URL regardless of which path was hit.
+  // Using two different URLs would cause Dust to treat / and /mcp as separate OAuth
+  // resources, launching two flows and creating duplicate MCP connections.
+  const metadataPath = `${BASE_URL}/.well-known/oauth-protected-resource`;
 
   const sendUnauthorized = (description: string) =>
     res.status(401)
@@ -873,7 +869,12 @@ function mcpHandler(req: Request, res: Response): void {
 }
 
 app.all('/mcp', mcpHandler);
-app.all('/', mcpHandler);
+
+// GET / is a public status page — intentionally no auth required.
+// Previously app.all('/', mcpHandler) caused Dust to see / and /mcp as two
+// separate OAuth resources, triggering two auth flows and creating duplicate
+// MCP connections. Now only /mcp is the canonical MCP endpoint.
+app.get('/', (_req, res) => res.json({ status: 'ok', server: 'odoo-mcp-oauth', version: '1.0.0' }));
 
 app.get('/health', (_req, res) => res.json({ status: 'ok' }));
 
