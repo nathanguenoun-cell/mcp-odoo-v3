@@ -424,7 +424,7 @@ app.get('/authorize', (req, res) => {
 
   res.set('X-Frame-Options', 'DENY')
      .set('X-Content-Type-Options', 'nosniff')
-     .set('Content-Security-Policy', `default-src 'none'; style-src 'unsafe-inline'; script-src 'unsafe-inline'; form-action ${BASE_URL}/authorize/submit`)
+     .set('Content-Security-Policy', `default-src 'none'; style-src 'unsafe-inline'; script-src 'unsafe-inline'`)
      .send(renderConnectForm(state));
 });
 
@@ -446,7 +446,7 @@ app.post('/authorize/submit', authLimiter, async (req, res) => {
   const sendForm = (err?: string) =>
     res.set('X-Frame-Options', 'DENY')
        .set('X-Content-Type-Options', 'nosniff')
-       .set('Content-Security-Policy', `default-src 'none'; style-src 'unsafe-inline'; script-src 'unsafe-inline'; form-action ${BASE_URL}/authorize/submit`)
+       .set('Content-Security-Policy', `default-src 'none'; style-src 'unsafe-inline'; script-src 'unsafe-inline'`)
        .send(renderConnectForm(state, { url, db, username }, err));
 
   if (!url || !username || !password) {
