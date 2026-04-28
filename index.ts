@@ -424,7 +424,7 @@ app.get('/authorize', (req, res) => {
 
   res.set('X-Frame-Options', 'DENY')
      .set('X-Content-Type-Options', 'nosniff')
-     .set('Content-Security-Policy', `default-src 'none'; style-src 'unsafe-inline'; script-src 'unsafe-inline'; form-action ${BASE_URL}`)
+     .set('Content-Security-Policy', `default-src 'none'; style-src 'unsafe-inline'; script-src 'unsafe-inline'; form-action ${BASE_URL}/authorize/submit`)
      .send(renderConnectForm(state));
 });
 
@@ -446,7 +446,7 @@ app.post('/authorize/submit', authLimiter, async (req, res) => {
   const sendForm = (err?: string) =>
     res.set('X-Frame-Options', 'DENY')
        .set('X-Content-Type-Options', 'nosniff')
-       .set('Content-Security-Policy', `default-src 'none'; style-src 'unsafe-inline'; script-src 'unsafe-inline'; form-action ${BASE_URL}`)
+       .set('Content-Security-Policy', `default-src 'none'; style-src 'unsafe-inline'; script-src 'unsafe-inline'; form-action ${BASE_URL}/authorize/submit`)
        .send(renderConnectForm(state, { url, db, username }, err));
 
   if (!url || !username || !password) {
@@ -941,7 +941,7 @@ function renderConnectForm(
   <h1>Connect to Odoo</h1>
   <p class="sub">Enter your Odoo credentials to connect your AI assistant to your Odoo instance.</p>
   ${error ? `<div class="err">${esc(error)}</div>` : ''}
-  <form action="/authorize/submit" method="post" id="f">
+  <form action="${BASE_URL}/authorize/submit" method="post" id="f">
     <input type="hidden" name="state" value="${esc(state)}">
 
     <div class="section">Odoo Instance</div>
