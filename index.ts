@@ -420,12 +420,11 @@ const mcpLimiter     = rateLimit({ windowMs: 15 * 60_000, max: 300, standardHead
 // OAUTH ENDPOINTS
 // ============================================================
 
-// RFC 9728 — single canonical resource matching BASE_URL.
-// Both / and /mcp point to this same resource_metadata so Dust sees
-// only one OAuth resource and creates exactly one MCP connection.
+// RFC 9728 — resource matches the /mcp endpoint so the client sees exactly
+// one OAuth resource and does not create a duplicate MCP connection.
 app.get('/.well-known/oauth-protected-resource', (_req, res) => {
   res.json({
-    resource: BASE_URL,
+    resource: `${BASE_URL}/mcp`,
     authorization_servers: [BASE_URL],
     scopes_supported: ['odoo'],
     bearer_methods_supported: ['header'],
