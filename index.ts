@@ -106,11 +106,12 @@ const accessTokens = new Map<string, StoredToken>();   // keyed by bearer token
 // ============================================================
 // TOKEN PERSISTENCE (Railway Volume at /data)
 // ============================================================
-// Only accessTokens need to survive restarts — pendingAuths and authCodes
-// are short-lived (≤15 min TTL) and are intentionally not persisted.
+// accessTokens and registeredClients survive restarts via the Railway Volume.
+// pendingAuths and authCodes are short-lived (≤15 min TTL) and not persisted.
 
 const DATA_DIR = process.env.DATA_DIR ?? '/data';
-const TOKENS_FILE = `${DATA_DIR}/tokens.json`;
+const TOKENS_FILE  = `${DATA_DIR}/tokens.json`;
+const CLIENTS_FILE = `${DATA_DIR}/clients.json`;
 
 function loadTokens(): void {
   try {
@@ -140,15 +141,37 @@ function saveTokens(): void {
   }
 }
 
+function loadClients(): void {
+  try {
+    if (!existsSync(CLIENTS_FILE)) return;
+    const raw = readFileSync(CLIENTS_FILE, 'utf8');
+    const entries = JSON.parse(raw) as Array<[string, { clientSecret: string; redirectUris: string[] }]>;
+    for (const [id, data] of entries) registeredClients.set(id, data);
+    if (entries.length > 0) console.log(`Restored ${entries.length} registered client(s) from disk.`);
+  } catch (err) {
+    console.warn('Could not load registered clients from disk (starting fresh):', err);
+  }
+}
+
+function saveClients(): void {
+  try {
+    mkdirSync(DATA_DIR, { recursive: true });
+    writeFileSync(CLIENTS_FILE, JSON.stringify([...registeredClients.entries()]), 'utf8');
+  } catch (err) {
+    console.warn('Could not save registered clients to disk:', err);
+  }
+}
+
 // Restore sessions immediately on startup
 loadTokens();
+loadClients();
 
 // Periodic save every 5 minutes — guards against hard crashes (SIGKILL, OOM)
-setInterval(() => saveTokens(), 5 * 60_000);
+setInterval(() => { saveTokens(); saveClients(); }, 5 * 60_000);
 
 // Graceful shutdown: Railway sends SIGTERM before stopping the container
-process.on('SIGTERM', () => { saveTokens(); process.exit(0); });
-process.on('SIGINT',  () => { saveTokens(); process.exit(0); });
+process.on('SIGTERM', () => { saveTokens(); saveClients(); process.exit(0); });
+process.on('SIGINT',  () => { saveTokens(); saveClients(); process.exit(0); });
 
 // Auth codes: 10-minute TTL. Interval runs every 2 min so the window is strict.
 setInterval(() => {
@@ -177,15 +200,17 @@ setInterval(() => {
 
 // Keepalive: prevent Odoo sessions from expiring due to inactivity.
 // Runs every 6 days — below Odoo's default 1-week session timeout.
-// If a session has already expired, the token is removed so Dust surfaces
-// a clean "Connect" prompt instead of a confusing error on next use.
+// Only removes the token on confirmed session expiry — transient network
+// errors are ignored so a momentary Odoo blip can't silently kill a session.
 setInterval(async () => {
   for (const [token, stored] of accessTokens) {
     try {
       const client = new OdooClient(stored.ctx);
       await client.callKw('res.lang', 'search_count', [[]], {});
-    } catch {
-      accessTokens.delete(token);
+    } catch (err) {
+      if (err instanceof OdooSessionExpiredError) {
+        accessTokens.delete(token);
+      }
     }
   }
 }, 6 * 24 * 60 * 60_000);
@@ -434,6 +459,7 @@ app.post('/register', registerLimiter, (req, res) => {
   const clientId = randomBytes(16).toString('hex');
   const clientSecret = randomBytes(32).toString('hex');
   registeredClients.set(clientId, { clientSecret, redirectUris: redirect_uris });
+  saveClients();
   res.status(201).json({
     client_id: clientId,
     client_secret: clientSecret,
