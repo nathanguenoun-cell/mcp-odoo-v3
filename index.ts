@@ -300,6 +300,8 @@ function nextId(): number { return ++rpcCounter; }
 class OdooClient {
   readonly db: string;
   readonly url: string;
+  /** Opaque per-session key (field visibility depends on the user's groups). */
+  readonly cacheKey: string;
   private readonly baseUrl: string;
   private readonly cookieHeader: string;
 
@@ -308,6 +310,7 @@ class OdooClient {
     this.db = ctx.db;
     this.url = ctx.url;
     this.cookieHeader = `session_id=${ctx.sessionId}`;
+    this.cacheKey = createHash('sha256').update(`${ctx.url}|${ctx.db}|${ctx.sessionId}`).digest('hex');
   }
 
   async callKw(
@@ -609,6 +612,277 @@ app.post('/token', tokenLimiter, (req, res) => {
 });
 
 // ============================================================
+// WRITE GUARDS — one tool = one ORM operation
+//
+// Each write tool must perform exactly one kind of operation, so that blocking
+// a tool in the MCP client (e.g. Dust) cannot be bypassed through another one:
+//   create_record → creates new records (and new sub-records) only
+//   update_record → modifies the target record only
+//   delete_record → deletes the target record only
+//
+// Without these checks, Odoo's generic ORM mechanisms let one tool do another
+// tool's job:
+//   - x2many commands: [0,_,vals] creates, [1,id,vals] writes on ANY record,
+//     [2,id] deletes ANY record; on one2many fields, [3]/[5]/[6]/false delete
+//     lines whose inverse is ondelete='cascade', and [4]/[6] re-parent
+//     existing lines.
+//   - related / delegated (_inherits) fields: setting them on create together
+//     with a link to an existing record writes on that existing record
+//     (e.g. product.product + product_tmpl_id=<existing> + list_price).
+//   - technical models: creating ir.cron / ir.actions.server / base.automation
+//     schedules arbitrary code; editing res.users / res.groups / ir.rule /
+//     ir.model.access changes access rights.
+//
+// Odoo access rights remain the real security boundary: these guards cover the
+// generic ORM mechanisms, not custom business logic in create()/write()
+// overrides, compute inverses or automated actions configured in Odoo.
+// ============================================================
+
+type WriteVerb = 'create' | 'update';
+
+const PROTECTED_MODEL_PREFIXES = ['ir.'];
+const PROTECTED_MODELS = ['base.automation', 'res.users', 'res.groups'];
+
+function isProtectedModel(model: string): boolean {
+  return (
+    PROTECTED_MODEL_PREFIXES.some(p => model.startsWith(p)) ||
+    PROTECTED_MODELS.some(m => model === m || model.startsWith(`${m}.`))
+  );
+}
+
+function assertWritableModel(model: string): void {
+  if (isProtectedModel(model)) {
+    throw new Error(`Model "${model}" is a technical model and cannot be modified via MCP.`);
+  }
+}
+
+interface FieldMeta {
+  type: string;
+  relation?: string;
+  related?: string | false;
+}
+
+const FIELDS_CACHE_TTL = 10 * 60_000;
+const FIELDS_CACHE_MAX = 2_000;
+const fieldsCache = new Map<string, { at: number; fields: Record<string, FieldMeta> }>();
+
+async function getFieldsMeta(client: OdooClient, model: string): Promise<Record<string, FieldMeta>> {
+  const key = `${client.cacheKey}|${model}`;
+  const hit = fieldsCache.get(key);
+  if (hit && Date.now() - hit.at < FIELDS_CACHE_TTL) return hit.fields;
+
+  const fields = await client.callKw(model, 'fields_get', [], {
+    attributes: ['type', 'relation', 'related'],
+  }) as Record<string, FieldMeta>;
+
+  if (fieldsCache.size >= FIELDS_CACHE_MAX) fieldsCache.clear();
+  fieldsCache.set(key, { at: Date.now(), fields });
+  return fields;
+}
+
+const MAX_SUBRECORD_DEPTH = 4;
+
+const isPlainObject = (v: unknown): v is Record<string, unknown> =>
+  typeof v === 'object' && v !== null && !Array.isArray(v);
+
+const isRecordId = (v: unknown): boolean => Number.isInteger(v) && (v as number) > 0;
+
+/**
+ * Throws unless `values` only performs `verb` on `model`.
+ * Nested sub-record values ([0, 0, {...}]) are checked recursively as creates.
+ */
+async function assertSafeValues(
+  client: OdooClient,
+  model: string,
+  values: unknown,
+  verb: WriteVerb,
+  depth = 0,
+): Promise<void> {
+  assertWritableModel(model);
+  if (!isPlainObject(values)) {
+    throw new Error(`"values" for ${model} must be an object of field values.`);
+  }
+  if (depth > MAX_SUBRECORD_DEPTH) {
+    throw new Error('Too many levels of nested sub-records.');
+  }
+
+  const meta = await getFieldsMeta(client, model);
+  const relatedHops = new Set<string>();
+
+  for (const [name, value] of Object.entries(values)) {
+    const field = meta[name];
+    const where = `${model}.${name}`;
+    if (!field) throw new Error(`Unknown field "${where}".`);
+
+    // Related and delegated fields write through to the record they point to.
+    // On create, that record must be created by this very call, never an existing one.
+    if (verb === 'create' && typeof field.related === 'string' && field.related) {
+      const hop = field.related.split('.')[0];
+      if (hop in values) {
+        throw new Error(
+          `"${where}" is a related field: setting it together with "${hop}" would modify ` +
+          `an existing record. create_record only creates records; use update_record for that change.`,
+        );
+      }
+      relatedHops.add(hop);
+    }
+
+    switch (field.type) {
+      case 'many2one':
+        if (value !== false && value !== null && !isRecordId(value)) {
+          throw new Error(`"${where}" expects a record ID (integer) or false.`);
+        }
+        break;
+
+      case 'one2many':
+        await assertOne2manyValue(client, field, value, verb, where, depth);
+        break;
+
+      case 'many2many':
+        await assertMany2manyValue(client, field, value, verb, where, depth);
+        break;
+    }
+  }
+
+  // Same protection when the link to the target record would come from a default value.
+  if (relatedHops.size > 0) {
+    const defaults = await client.callKw(model, 'default_get', [[...relatedHops]], {}) as Record<string, unknown>;
+    const linked = [...relatedHops].filter(hop => defaults?.[hop]);
+    if (linked.length > 0) {
+      throw new Error(
+        `Related fields of ${model} would write on the existing record(s) linked by default ` +
+        `through ${linked.map(h => `"${h}"`).join(', ')}. create_record only creates records; use update_record for that change.`,
+      );
+    }
+  }
+}
+
+async function assertOne2manyValue(
+  client: OdooClient, field: FieldMeta, value: unknown, verb: WriteVerb, where: string, depth: number,
+): Promise<void> {
+  const lineModel = field.relation ?? 'the line model';
+
+  if (verb === 'update') {
+    // Any one2many command can create, modify, re-parent or (cascade-)delete lines.
+    if (Array.isArray(value) && value.length === 0) return;
+    throw new Error(
+      `update_record cannot change the lines of "${where}". ` +
+      `Use create_record, update_record or delete_record directly on ${lineModel}.`,
+    );
+  }
+
+  // create: only brand-new lines are allowed ([0, 0, {...}]).
+  if (value === false || value === null) return; // no-op on a new record
+  if (!Array.isArray(value)) throw new Error(`"${where}" expects a list of commands.`);
+  for (const cmd of value) {
+    if (Array.isArray(cmd) && cmd[0] === 0 && isPlainObject(cmd[2])) {
+      await assertSafeValues(client, lineModel, cmd[2], 'create', depth + 1);
+      continue;
+    }
+    throw new Error(
+      `create_record can only create new lines in "${where}" with [0, 0, {...}]. ` +
+      `Use update_record or delete_record on ${lineModel} for existing lines.`,
+    );
+  }
+}
+
+async function assertMany2manyValue(
+  client: OdooClient, field: FieldMeta, value: unknown, verb: WriteVerb, where: string, depth: number,
+): Promise<void> {
+  // false / null clears the relation only — the linked records are untouched.
+  if (value === false || value === null) return;
+  if (!Array.isArray(value)) throw new Error(`"${where}" expects a list of IDs or commands.`);
+  if (value.length === 0) return;
+
+  // Plain list of IDs = replace the relation (relation table only).
+  if (!Array.isArray(value[0])) {
+    if (value.every(isRecordId)) return;
+    throw new Error(`"${where}" expects a list of record IDs or a list of commands.`);
+  }
+
+  for (const cmd of value) {
+    if (!Array.isArray(cmd)) throw new Error(`"${where}" mixes IDs and commands.`);
+    const [op, arg1, arg2] = cmd as [unknown, unknown, unknown];
+
+    if (op === 0 && verb === 'create' && isPlainObject(arg2)) {
+      await assertSafeValues(client, field.relation ?? '', arg2, 'create', depth + 1);
+      continue;
+    }
+    // 3 = unlink, 4 = link, 5 = clear, 6 = replace: relation table only.
+    if ((op === 3 || op === 4) && isRecordId(arg1)) continue;
+    if (op === 5) continue;
+    if (op === 6 && Array.isArray(arg2) && arg2.every(isRecordId)) continue;
+
+    throw new Error(
+      `Command [${String(op)}, ...] is not allowed in "${where}" with ${verb}_record: ` +
+      `only linking / unlinking existing records ([3, id], [4, id], [5], [6, 0, ids])` +
+      (verb === 'create' ? ' or creating new ones ([0, 0, {...}])' : '') +
+      ` is permitted. Use the dedicated tool on ${field.relation ?? 'the related model'} instead.`,
+    );
+  }
+}
+
+// ============================================================
+// BUSINESS ACTIONS — server-side allowlist
+//
+// run_business_action replaces the former execute_method tool, which could call
+// any Odoo method and therefore bypass every other tool. It only runs the
+// methods listed in the ALLOWED_METHODS environment variable, as comma-separated
+// "model:method" pairs. The check runs on every call, before anything is sent
+// to Odoo, whatever the agent asks:
+//   - empty or unset variable → every call is refused;
+//   - exact match only, no wildcard;
+//   - generic ORM methods, private methods and technical models are never
+//     accepted, even when listed;
+//   - the call only carries record IDs: no free arguments, empty Odoo context.
+// The variable is read at startup: redeploy after changing it.
+// ============================================================
+
+const NEVER_ALLOWED_METHODS = new Set([
+  // Generic writes — handled (and guarded) by create_record / update_record / delete_record
+  'create', 'write', 'unlink', 'copy', 'copy_data', 'load', 'web_save', 'name_create',
+  'toggle_active', 'action_archive', 'action_unarchive',
+  // Generic reads — handled by the read tools
+  'read', 'search', 'search_read', 'search_count', 'search_fetch', 'read_group', 'web_read',
+  'web_read_group', 'web_search_read', 'name_search', 'name_get', 'fields_get', 'default_get',
+  'onchange', 'export_data', 'get_views', 'fields_view_get', 'get_metadata',
+  // Environment switches
+  'sudo', 'with_user', 'with_context', 'with_company', 'with_env',
+]);
+
+// model: lowercase segments separated by dots; method: must not start with "_" (private).
+const ALLOWED_METHOD_ENTRY = /^([a-z][a-z0-9_]*(?:\.[a-z0-9_]+)*):([a-zA-Z][a-zA-Z0-9_]*)$/;
+
+function parseAllowedMethods(raw: string | undefined): Set<string> {
+  const allowed = new Set<string>();
+  for (const entry of (raw ?? '').split(',').map(s => s.trim()).filter(Boolean)) {
+    const match = ALLOWED_METHOD_ENTRY.exec(entry);
+    if (!match) {
+      console.warn(`ALLOWED_METHODS: ignoring "${entry}" (expected model:method).`);
+      continue;
+    }
+    const [, model, method] = match;
+    if (NEVER_ALLOWED_METHODS.has(method)) {
+      console.warn(`ALLOWED_METHODS: ignoring "${entry}" (generic ORM method, use the dedicated tools).`);
+      continue;
+    }
+    if (isProtectedModel(model)) {
+      console.warn(`ALLOWED_METHODS: ignoring "${entry}" (technical model).`);
+      continue;
+    }
+    allowed.add(`${model}:${method}`);
+  }
+  return allowed;
+}
+
+const ALLOWED_METHODS = parseAllowedMethods(process.env.ALLOWED_METHODS);
+const MAX_ACTION_RECORDS = 100;
+
+const ALLOWED_METHODS_SUMMARY = ALLOWED_METHODS.size === 0
+  ? 'No business action is currently authorized on this server: every call is refused.'
+  : `Authorized actions (model:method): ${[...ALLOWED_METHODS].join(', ')}. Any other action is refused.`;
+
+// ============================================================
 // MCP TOOL DEFINITIONS
 // ============================================================
 
@@ -659,14 +933,20 @@ const MCP_TOOLS = [
   },
   {
     name: 'create_record',
-    description: 'Create a new record in an Odoo model. Returns the ID of the created record.',
+    description:
+      'Create a new record in an Odoo model. Returns the ID of the created record. ' +
+      'Only creates: it never modifies or deletes existing records. One2many lines can be created inline ' +
+      'with [[0, 0, {...}]]; many2many fields accept a list of IDs to link. Technical models (ir.*, ' +
+      'base.automation, res.users, res.groups) cannot be modified.',
     inputSchema: {
       type: 'object',
       properties: {
         model: { type: 'string', description: 'Odoo model name' },
         values: {
           type: 'object',
-          description: 'Field values for the new record. Example: {"name": "ACME Corp", "is_company": true}',
+          description:
+            'Field values for the new record. Example: {"name": "ACME Corp", "is_company": true}. ' +
+            'Sale order with lines: {"partner_id": 7, "order_line": [[0, 0, {"product_id": 3, "product_uom_qty": 2}]]}',
         },
       },
       required: ['model', 'values'],
@@ -674,7 +954,12 @@ const MCP_TOOLS = [
   },
   {
     name: 'update_record',
-    description: 'Update an existing Odoo record.',
+    description:
+      'Update fields of one existing Odoo record. Only modifies that record: it cannot create or delete ' +
+      'records. One2many lines cannot be changed here — use create_record, update_record or delete_record ' +
+      'directly on the line model (e.g. sale.order.line). Many2many fields: [[4, id]] to link, [[3, id]] to ' +
+      'unlink, [[6, 0, [ids]]] to replace. Technical models (ir.*, base.automation, res.users, res.groups) ' +
+      'cannot be modified.',
     inputSchema: {
       type: 'object',
       properties: {
@@ -690,7 +975,9 @@ const MCP_TOOLS = [
   },
   {
     name: 'delete_record',
-    description: 'Delete a record from Odoo. This action cannot be undone.',
+    description:
+      'Delete a record from Odoo. This action cannot be undone. Technical models (ir.*, base.automation, ' +
+      'res.users, res.groups) cannot be deleted from.',
     inputSchema: {
       type: 'object',
       properties: {
@@ -731,25 +1018,25 @@ const MCP_TOOLS = [
     inputSchema: { type: 'object', properties: {} },
   },
   {
-    name: 'execute_method',
-    description: 'Execute any Odoo model method directly (advanced). Useful for calling business methods like confirm(), action_validate(), etc.',
+    name: 'run_business_action',
+    description:
+      'Run an authorized Odoo business action on existing records — the equivalent of clicking a form button ' +
+      'such as "Confirm" on a quotation or "Post" on an invoice. Only the actions configured by the server ' +
+      `administrator can run. ${ALLOWED_METHODS_SUMMARY}`,
     inputSchema: {
       type: 'object',
       properties: {
-        model: { type: 'string', description: 'Odoo model name' },
-        method: { type: 'string', description: "Method name. Examples: 'action_confirm', 'action_validate', 'name_search'" },
-        args: {
+        model: { type: 'string', description: 'Odoo model name, e.g. "sale.order"' },
+        method: { type: 'string', description: 'Action method name, e.g. "action_confirm"' },
+        record_ids: {
           type: 'array',
-          description: 'Positional arguments (first arg is usually a list of IDs). Example: [[42]]',
-          default: [],
-        },
-        kwargs: {
-          type: 'object',
-          description: 'Keyword arguments. Example: {"context": {"lang": "fr_FR"}}',
-          default: {},
+          items: { type: 'integer' },
+          minItems: 1,
+          maxItems: MAX_ACTION_RECORDS,
+          description: 'IDs of the records to run the action on',
         },
       },
-      required: ['model', 'method'],
+      required: ['model', 'method', 'record_ids'],
     },
   },
 ];
@@ -788,18 +1075,23 @@ async function handleToolCall(
 
     case 'create_record': {
       const { model, values } = input as { model: string; values: Record<string, unknown> };
+      await assertSafeValues(client, model, values, 'create');
       const id = await client.callKw(model, 'create', [values], {}) as number;
       return { id, success: true, message: `Created ${model} record with ID ${id}` };
     }
 
     case 'update_record': {
       const { model, id, values } = input as { model: string; id: number; values: Record<string, unknown> };
+      if (!isRecordId(id)) throw new Error('"id" must be a positive integer.');
+      await assertSafeValues(client, model, values, 'update');
       await client.callKw(model, 'write', [[id], values], {});
       return { success: true, message: `Updated ${model} record ${id}` };
     }
 
     case 'delete_record': {
       const { model, id } = input as { model: string; id: number };
+      assertWritableModel(model);
+      if (!isRecordId(id)) throw new Error('"id" must be a positive integer.');
       await client.callKw(model, 'unlink', [[id]], {});
       return { success: true, message: `Deleted ${model} record ${id}` };
     }
@@ -836,16 +1128,34 @@ async function handleToolCall(
       };
     }
 
-    case 'execute_method': {
-      const { model, method, args = [], kwargs = {} } = input as {
-        model: string; method: string; args?: unknown[]; kwargs?: Record<string, unknown>;
-      };
-      // Block private/internal Odoo methods (prefixed with _) — these are never
-      // part of the public API and could expose dangerous low-level operations.
-      if (method.startsWith('_')) {
-        throw new Error(`Method "${method}" is private and cannot be called via MCP.`);
+    case 'run_business_action': {
+      const { model, method, record_ids } = input as { model: unknown; method: unknown; record_ids: unknown };
+      const action = `${String(model)}:${String(method)}`;
+
+      // Hard filter: exact match against the server-side allowlist, before any call to Odoo.
+      if (typeof model !== 'string' || typeof method !== 'string' || !ALLOWED_METHODS.has(action)) {
+        console.warn(`[run_business_action] refused ${JSON.stringify(action)}`);
+        throw new Error(`Action "${action}" is not authorized on this server. ${ALLOWED_METHODS_SUMMARY}`);
       }
-      const result = await client.callKw(model, method, args as unknown[], kwargs);
+      if (
+        !Array.isArray(record_ids) || record_ids.length === 0 ||
+        record_ids.length > MAX_ACTION_RECORDS || !record_ids.every(isRecordId)
+      ) {
+        throw new Error(`"record_ids" must be a list of 1 to ${MAX_ACTION_RECORDS} record IDs.`);
+      }
+
+      console.log(`[run_business_action] ${action} on ${record_ids.length} record(s)`);
+      // Only the record IDs are sent: no free arguments, empty Odoo context.
+      const result = await client.callKw(model, method, [record_ids], {});
+
+      if (isPlainObject(result) && typeof result.type === 'string' && result.type.startsWith('ir.actions.')) {
+        return {
+          result,
+          note:
+            'The action returned an Odoo window or action (e.g. a wizard) instead of completing. ' +
+            'It needs further steps that this tool does not perform.',
+        };
+      }
       return { result };
     }
 
@@ -1071,5 +1381,6 @@ app.listen(PORT, () => {
   console.log(`\nOdoo MCP OAuth Server`);
   console.log(`  MCP endpoint      : ${BASE_URL}/mcp`);
   console.log(`  OAuth discovery   : ${BASE_URL}/.well-known/oauth-authorization-server`);
-  console.log(`  Health            : ${BASE_URL}/health\n`);
+  console.log(`  Health            : ${BASE_URL}/health`);
+  console.log(`  Business actions  : ${ALLOWED_METHODS.size === 0 ? 'none authorized' : [...ALLOWED_METHODS].join(', ')}\n`);
 });
